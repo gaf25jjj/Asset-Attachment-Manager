@@ -149,16 +149,23 @@ def ensure_topic(user: types.User) -> tuple[int, int | None]:
     # Сохраняем в БД, получаем номер тикета
     ticket_number = save_topic(user.id, topic_id)
 
-    # Системное сообщение в тему для админов
+    # Системное сообщение в тему для админов с кнопкой закрытия
     username_part = f"@{user.username}" if user.username else ""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="✅ Закрыть тикет",
+            callback_data=f"close:{topic_id}",
+        )
+    )
     bot.send_message(
         ADMIN_GROUP_ID,
         f"🆕 <b>Новое обращение #{ticket_number:06d}</b>\n"
         f"👤 <b>Имя:</b> {display_name} {username_part}\n"
-        f"🆔 <b>ID:</b> <code>{user.id}</code>\n\n"
-        f"Чтобы закрыть тикет, напишите /close в этой теме.",
+        f"🆔 <b>ID:</b> <code>{user.id}</code>",
         message_thread_id=topic_id,
         parse_mode="HTML",
+        reply_markup=keyboard,
     )
 
     return topic_id, ticket_number
@@ -180,26 +187,21 @@ def handle_start(message: types.Message):
 
 
 # ─────────────────────────────────────────────
-# /close — закрыть тикет (только для админов в теме)
+# Общая функция закрытия тикета
 # ─────────────────────────────────────────────
-@bot.message_handler(
-    commands=["close"],
-    func=lambda msg: (
-        msg.chat.id == ADMIN_GROUP_ID
-        and msg.is_topic_message
-        and msg.message_thread_id is not None
-    ),
-)
-def handle_close(message: types.Message):
-    """Закрывает тикет. Используется администраторами внутри темы."""
-    topic_id = message.message_thread_id
+def do_close_ticket(topic_id: int, notify_thread_id: int | None = None):
+    """
+    Закрывает тикет: обновляет БД, уведомляет пользователя и закрывает тему.
+    notify_thread_id — куда слать сообщение в группу (обычно совпадает с topic_id).
+    """
+    thread = notify_thread_id if notify_thread_id is not None else topic_id
     result = close_topic_by_thread(topic_id)
 
     if result is None:
         bot.send_message(
             ADMIN_GROUP_ID,
             "⚠️ Тикет уже закрыт или не найден.",
-            message_thread_id=topic_id,
+            message_thread_id=thread,
         )
         return
 
@@ -210,7 +212,7 @@ def handle_close(message: types.Message):
         ADMIN_GROUP_ID,
         f"✅ <b>Тикет #{ticket_number:06d} закрыт.</b>\n"
         f"Пользователь уведомлён. При следующем обращении будет создан новый тикет.",
-        message_thread_id=topic_id,
+        message_thread_id=thread,
         parse_mode="HTML",
     )
 
@@ -218,7 +220,7 @@ def handle_close(message: types.Message):
     try:
         bot.close_forum_topic(ADMIN_GROUP_ID, topic_id)
     except Exception:
-        pass  # Если нет прав — просто пропускаем
+        pass
 
     # Уведомление пользователю
     try:
@@ -231,7 +233,48 @@ def handle_close(message: types.Message):
             parse_mode="HTML",
         )
     except telebot.apihelper.ApiTelegramException:
-        pass  # Пользователь заблокировал бота — игнорируем
+        pass
+
+
+# ─────────────────────────────────────────────
+# /close — закрыть тикет командой (только для админов в теме)
+# ─────────────────────────────────────────────
+@bot.message_handler(
+    commands=["close"],
+    func=lambda msg: (
+        msg.chat.id == ADMIN_GROUP_ID
+        and msg.is_topic_message
+        and msg.message_thread_id is not None
+    ),
+)
+def handle_close(message: types.Message):
+    """Закрывает тикет через команду /close."""
+    do_close_ticket(message.message_thread_id)
+
+
+# ─────────────────────────────────────────────
+# Кнопка «Закрыть тикет» — callback от инлайн-кнопки
+# ─────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: call.data.startswith("close:"))
+def handle_close_callback(call: types.CallbackQuery):
+    """Обрабатывает нажатие кнопки ✅ Закрыть тикет."""
+    topic_id = int(call.data.split(":")[1])
+
+    # Убираем кнопку с сообщения (чтобы нельзя было нажать повторно)
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    # Закрываем тикет, уведомления шлём в ту же тему
+    do_close_ticket(topic_id, notify_thread_id=call.message.message_thread_id)
+
+    # Подтверждение нажатия кнопки (убирает «часики» у Telegram)
+    bot.answer_callback_query(call.id, "Тикет закрыт ✅")
 
 
 # ─────────────────────────────────────────────
