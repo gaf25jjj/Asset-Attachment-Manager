@@ -18,33 +18,49 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "support.db")
 
 
 def init_db():
-    """Инициализация базы данных и создание таблицы topics."""
+    """Инициализация БД. ticket_number — автоматический порядковый номер обращения."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    # Основная таблица: ticket_number — уникальный номер обращения (AUTOINCREMENT)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS topics (
-            user_id  INTEGER PRIMARY KEY,
-            topic_id INTEGER NOT NULL
+            ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       INTEGER UNIQUE NOT NULL,
+            topic_id      INTEGER NOT NULL
         )
     """)
+    # Миграция: если таблица создана со старой схемой (user_id PRIMARY KEY) — пересоздаём
+    cursor.execute("PRAGMA table_info(topics)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "ticket_number" not in columns:
+        cursor.execute("DROP TABLE topics")
+        cursor.execute("""
+            CREATE TABLE topics (
+                ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER UNIQUE NOT NULL,
+                topic_id      INTEGER NOT NULL
+            )
+        """)
     conn.commit()
     conn.close()
 
 
-def save_topic(user_id: int, topic_id: int):
-    """Сохранить связку user_id ↔ topic_id."""
+def save_topic(user_id: int, topic_id: int) -> int:
+    """Сохранить связку и вернуть номер обращения (ticket_number)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR REPLACE INTO topics (user_id, topic_id) VALUES (?, ?)",
+        "INSERT INTO topics (user_id, topic_id) VALUES (?, ?)",
         (user_id, topic_id),
     )
+    ticket_number = cursor.lastrowid
     conn.commit()
     conn.close()
+    return ticket_number
 
 
 def get_topic_id(user_id: int) -> int | None:
-    """Найти topic_id по user_id. Возвращает None, если запись не найдена."""
+    """Найти topic_id по user_id."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT topic_id FROM topics WHERE user_id = ?", (user_id,))
@@ -54,7 +70,7 @@ def get_topic_id(user_id: int) -> int | None:
 
 
 def get_user_id(topic_id: int) -> int | None:
-    """Найти user_id по topic_id. Возвращает None, если запись не найдена."""
+    """Найти user_id по topic_id."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM topics WHERE topic_id = ?", (topic_id,))
@@ -74,13 +90,14 @@ def get_display_name(user: types.User) -> str:
     return name.strip() or f"user_{user.id}"
 
 
-def ensure_topic(user: types.User) -> int:
+def ensure_topic(user: types.User) -> tuple[int, int | None]:
     """
-    Вернуть существующий topic_id или создать новую тему в админ-группе.
+    Вернуть (topic_id, ticket_number).
+    ticket_number = None если тема уже существовала (повторное обращение).
     """
     topic_id = get_topic_id(user.id)
     if topic_id:
-        return topic_id
+        return topic_id, None  # Уже существует — номер не нужен
 
     display_name = get_display_name(user)
     topic_name = f"{display_name} | {user.id}"
@@ -89,35 +106,40 @@ def ensure_topic(user: types.User) -> int:
     forum_topic = bot.create_forum_topic(ADMIN_GROUP_ID, topic_name)
     topic_id = forum_topic.message_thread_id
 
-    # Сохраняем связку в БД
-    save_topic(user.id, topic_id)
+    # Сохраняем в БД, получаем номер обращения
+    ticket_number = save_topic(user.id, topic_id)
 
-    # Системное сообщение в тему
+    # Системное сообщение в тему для админов
     username_part = f"@{user.username}" if user.username else ""
     bot.send_message(
         ADMIN_GROUP_ID,
-        f"🆕 <b>Новое обращение</b>\n"
+        f"🆕 <b>Новое обращение #{ticket_number:06d}</b>\n"
         f"👤 <b>Имя:</b> {display_name} {username_part}\n"
         f"🆔 <b>ID:</b> <code>{user.id}</code>",
         message_thread_id=topic_id,
         parse_mode="HTML",
     )
 
-    # Автоответ пользователю при первом обращении
-    bot.send_message(
-        user.id,
-        "📨 Спасибо! Ваш запрос успешно зафиксирован.\n\n"
-        "Мы уже передали его специалистам технической поддержки. "
-        "Обычно ответ занимает всего несколько минут.\n\n"
-        "Пожалуйста, не отправляйте повторные сообщения — это может увеличить время обработки.\n\n"
-        "Благодарим за выбор нашего VPN! 💙",
-    )
-
-    return topic_id
+    return topic_id, ticket_number
 
 
 # ─────────────────────────────────────────────
-# Обработчики сообщений от ПОЛЬЗОВАТЕЛЕЙ
+# /start — приветствие и приглашение написать
+# ─────────────────────────────────────────────
+@bot.message_handler(commands=["start"])
+def handle_start(message: types.Message):
+    """Приветствуем пользователя и просим описать проблему."""
+    bot.send_message(
+        message.chat.id,
+        "👋 Добро пожаловать в поддержку!\n\n"
+        "Пожалуйста, опишите вашу проблему или вопрос — и мы передадим его специалистам.\n\n"
+        "✍️ <b>Напишите ваш вопрос в следующем сообщении.</b>",
+        parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────────
+# Сообщения от ПОЛЬЗОВАТЕЛЕЙ
 # ─────────────────────────────────────────────
 ALLOWED_CONTENT_TYPES = ["text", "photo", "video", "document", "voice"]
 
@@ -129,9 +151,9 @@ ALLOWED_CONTENT_TYPES = ["text", "photo", "video", "document", "voice"]
 def handle_user_message(message: types.Message):
     """Принимаем сообщение от пользователя и пересылаем в нужную тему."""
     user = message.from_user
-    topic_id = ensure_topic(user)
+    topic_id, ticket_number = ensure_topic(user)
 
-    # Пересылаем оригинальное сообщение в тему
+    # Пересылаем сообщение в тему
     bot.forward_message(
         chat_id=ADMIN_GROUP_ID,
         from_chat_id=message.chat.id,
@@ -139,9 +161,22 @@ def handle_user_message(message: types.Message):
         message_thread_id=topic_id,
     )
 
+    # Подтверждение только при первом сообщении (новый тикет)
+    if ticket_number is not None:
+        bot.send_message(
+            message.chat.id,
+            f"📨 <b>Спасибо! Ваш запрос успешно зафиксирован.</b>\n\n"
+            f"🎫 Номер обращения: <b>#{ticket_number:06d}</b>\n\n"
+            f"Мы уже передали его специалистам технической поддержки. "
+            f"Обычно ответ занимает всего несколько минут.\n\n"
+            f"Пожалуйста, не отправляйте повторные сообщения — это может увеличить время обработки.\n\n"
+            f"Благодарим за выбор нашего VPN! 💙",
+            parse_mode="HTML",
+        )
+
 
 # ─────────────────────────────────────────────
-# Обработчики сообщений от АДМИНИСТРАТОРОВ
+# Сообщения от АДМИНИСТРАТОРОВ
 # ─────────────────────────────────────────────
 @bot.message_handler(
     func=lambda msg: (
@@ -158,30 +193,23 @@ def handle_admin_message(message: types.Message):
     user_id = get_user_id(topic_id)
 
     if user_id is None:
-        # Тема не связана ни с каким пользователем — игнорируем
         return
 
     try:
         if message.content_type == "text":
-            # Для текста — отправляем напрямую
             bot.send_message(user_id, message.text)
         else:
-            # Для медиа — копируем сообщение
             bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
     except telebot.apihelper.ApiTelegramException as e:
-        # Если пользователь заблокировал бота — уведомляем админов в теме
-        error_text = (
-            f"⚠️ <b>Не удалось доставить сообщение</b>\n"
-            f"Пользователь (ID: <code>{user_id}</code>) заблокировал бота.\n"
-            f"<i>Ошибка: {e}</i>"
-        )
         bot.send_message(
             ADMIN_GROUP_ID,
-            error_text,
+            f"⚠️ <b>Не удалось доставить сообщение</b>\n"
+            f"Пользователь (ID: <code>{user_id}</code>) заблокировал бота.\n"
+            f"<i>Ошибка: {e}</i>",
             message_thread_id=topic_id,
             parse_mode="HTML",
         )
