@@ -18,39 +18,47 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "support.db")
 
 
 def init_db():
-    """Инициализация БД. ticket_number — автоматический порядковый номер обращения."""
+    """Инициализация БД и миграция схемы при необходимости."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Основная таблица: ticket_number — уникальный номер обращения (AUTOINCREMENT)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS topics (
             ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id       INTEGER UNIQUE NOT NULL,
-            topic_id      INTEGER NOT NULL
+            user_id       INTEGER NOT NULL,
+            topic_id      INTEGER NOT NULL,
+            closed        INTEGER NOT NULL DEFAULT 0
         )
     """)
-    # Миграция: если таблица создана со старой схемой (user_id PRIMARY KEY) — пересоздаём
+
+    # Миграция: добавить колонку closed если её нет (старая схема)
     cursor.execute("PRAGMA table_info(topics)")
     columns = {row[1] for row in cursor.fetchall()}
+
     if "ticket_number" not in columns:
+        # Совсем старая схема — пересоздаём
         cursor.execute("DROP TABLE topics")
         cursor.execute("""
             CREATE TABLE topics (
                 ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id       INTEGER UNIQUE NOT NULL,
-                topic_id      INTEGER NOT NULL
+                user_id       INTEGER NOT NULL,
+                topic_id      INTEGER NOT NULL,
+                closed        INTEGER NOT NULL DEFAULT 0
             )
         """)
+    elif "closed" not in columns:
+        cursor.execute("ALTER TABLE topics ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
+
     conn.commit()
     conn.close()
 
 
 def save_topic(user_id: int, topic_id: int) -> int:
-    """Сохранить связку и вернуть номер обращения (ticket_number)."""
+    """Сохранить новый тикет и вернуть его номер."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO topics (user_id, topic_id) VALUES (?, ?)",
+        "INSERT INTO topics (user_id, topic_id, closed) VALUES (?, ?, 0)",
         (user_id, topic_id),
     )
     ticket_number = cursor.lastrowid
@@ -59,24 +67,55 @@ def save_topic(user_id: int, topic_id: int) -> int:
     return ticket_number
 
 
-def get_topic_id(user_id: int) -> int | None:
-    """Найти topic_id по user_id."""
+def get_active_topic(user_id: int) -> tuple[int, int] | None:
+    """Найти активный (не закрытый) тикет для пользователя. Возвращает (topic_id, ticket_number) или None."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT topic_id FROM topics WHERE user_id = ?", (user_id,))
+    cursor.execute(
+        "SELECT topic_id, ticket_number FROM topics WHERE user_id = ? AND closed = 0 ORDER BY ticket_number DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return (row[0], row[1]) if row else None
+
+
+def get_user_id_by_topic(topic_id: int) -> int | None:
+    """Найти user_id по topic_id (только открытые тикеты)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id FROM topics WHERE topic_id = ? AND closed = 0",
+        (topic_id,),
+    )
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else None
 
 
-def get_user_id(topic_id: int) -> int | None:
-    """Найти user_id по topic_id."""
+def close_topic_by_thread(topic_id: int) -> tuple[int, int] | None:
+    """
+    Закрыть тикет по topic_id.
+    Возвращает (user_id, ticket_number) или None если тикет не найден / уже закрыт.
+    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM topics WHERE topic_id = ?", (topic_id,))
+    cursor.execute(
+        "SELECT user_id, ticket_number FROM topics WHERE topic_id = ? AND closed = 0",
+        (topic_id,),
+    )
     row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+    user_id, ticket_number = row
+    cursor.execute(
+        "UPDATE topics SET closed = 1 WHERE topic_id = ?",
+        (topic_id,),
+    )
+    conn.commit()
     conn.close()
-    return row[0] if row else None
+    return user_id, ticket_number
 
 
 # ─────────────────────────────────────────────
@@ -93,20 +132,21 @@ def get_display_name(user: types.User) -> str:
 def ensure_topic(user: types.User) -> tuple[int, int | None]:
     """
     Вернуть (topic_id, ticket_number).
-    ticket_number = None если тема уже существовала (повторное обращение).
+    ticket_number = None если активный тикет уже существует.
+    Если тикет закрыт — создаёт новый.
     """
-    topic_id = get_topic_id(user.id)
-    if topic_id:
-        return topic_id, None  # Уже существует — номер не нужен
+    existing = get_active_topic(user.id)
+    if existing:
+        return existing[0], None  # (topic_id, нет нового номера)
 
     display_name = get_display_name(user)
     topic_name = f"{display_name} | {user.id}"
 
-    # Создаём тему (Forum Topic) в супергруппе
+    # Создаём новую тему в супергруппе
     forum_topic = bot.create_forum_topic(ADMIN_GROUP_ID, topic_name)
     topic_id = forum_topic.message_thread_id
 
-    # Сохраняем в БД, получаем номер обращения
+    # Сохраняем в БД, получаем номер тикета
     ticket_number = save_topic(user.id, topic_id)
 
     # Системное сообщение в тему для админов
@@ -115,7 +155,8 @@ def ensure_topic(user: types.User) -> tuple[int, int | None]:
         ADMIN_GROUP_ID,
         f"🆕 <b>Новое обращение #{ticket_number:06d}</b>\n"
         f"👤 <b>Имя:</b> {display_name} {username_part}\n"
-        f"🆔 <b>ID:</b> <code>{user.id}</code>",
+        f"🆔 <b>ID:</b> <code>{user.id}</code>\n\n"
+        f"Чтобы закрыть тикет, напишите /close в этой теме.",
         message_thread_id=topic_id,
         parse_mode="HTML",
     )
@@ -124,7 +165,7 @@ def ensure_topic(user: types.User) -> tuple[int, int | None]:
 
 
 # ─────────────────────────────────────────────
-# /start — приветствие и приглашение написать
+# /start — приветствие
 # ─────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def handle_start(message: types.Message):
@@ -136,6 +177,61 @@ def handle_start(message: types.Message):
         "✍️ <b>Напишите ваш вопрос в следующем сообщении.</b>",
         parse_mode="HTML",
     )
+
+
+# ─────────────────────────────────────────────
+# /close — закрыть тикет (только для админов в теме)
+# ─────────────────────────────────────────────
+@bot.message_handler(
+    commands=["close"],
+    func=lambda msg: (
+        msg.chat.id == ADMIN_GROUP_ID
+        and msg.is_topic_message
+        and msg.message_thread_id is not None
+    ),
+)
+def handle_close(message: types.Message):
+    """Закрывает тикет. Используется администраторами внутри темы."""
+    topic_id = message.message_thread_id
+    result = close_topic_by_thread(topic_id)
+
+    if result is None:
+        bot.send_message(
+            ADMIN_GROUP_ID,
+            "⚠️ Тикет уже закрыт или не найден.",
+            message_thread_id=topic_id,
+        )
+        return
+
+    user_id, ticket_number = result
+
+    # Уведомление в тему для админов
+    bot.send_message(
+        ADMIN_GROUP_ID,
+        f"✅ <b>Тикет #{ticket_number:06d} закрыт.</b>\n"
+        f"Пользователь уведомлён. При следующем обращении будет создан новый тикет.",
+        message_thread_id=topic_id,
+        parse_mode="HTML",
+    )
+
+    # Закрываем форум-тему в группе
+    try:
+        bot.close_forum_topic(ADMIN_GROUP_ID, topic_id)
+    except Exception:
+        pass  # Если нет прав — просто пропускаем
+
+    # Уведомление пользователю
+    try:
+        bot.send_message(
+            user_id,
+            f"✅ <b>Ваше обращение #{ticket_number:06d} закрыто.</b>\n\n"
+            f"Если у вас появится новый вопрос — просто напишите нам, "
+            f"и мы создадим новое обращение.\n\n"
+            f"Благодарим за выбор нашего VPN! 💙",
+            parse_mode="HTML",
+        )
+    except telebot.apihelper.ApiTelegramException:
+        pass  # Пользователь заблокировал бота — игнорируем
 
 
 # ─────────────────────────────────────────────
@@ -161,7 +257,7 @@ def handle_user_message(message: types.Message):
         message_thread_id=topic_id,
     )
 
-    # Подтверждение только при первом сообщении (новый тикет)
+    # Подтверждение только при первом сообщении нового тикета
     if ticket_number is not None:
         bot.send_message(
             message.chat.id,
@@ -190,10 +286,10 @@ def handle_user_message(message: types.Message):
 def handle_admin_message(message: types.Message):
     """Принимаем ответ администратора в теме и отправляем пользователю."""
     topic_id = message.message_thread_id
-    user_id = get_user_id(topic_id)
+    user_id = get_user_id_by_topic(topic_id)
 
     if user_id is None:
-        return
+        return  # Тикет закрыт или не найден
 
     try:
         if message.content_type == "text":
