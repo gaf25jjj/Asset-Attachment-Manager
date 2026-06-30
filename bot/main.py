@@ -17,37 +17,55 @@ bot = telebot.TeleBot(TOKEN)
 DB_PATH = os.path.join(os.path.dirname(__file__), "support.db")
 
 
+CORRECT_SCHEMA = """
+    CREATE TABLE topics (
+        ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL,
+        topic_id      INTEGER NOT NULL,
+        closed        INTEGER NOT NULL DEFAULT 0
+    )
+"""
+
+
+def _has_unique_on_user_id(cursor) -> bool:
+    """Проверить, есть ли UNIQUE-индекс на колонке user_id."""
+    cursor.execute("PRAGMA index_list(topics)")
+    for idx in cursor.fetchall():
+        if idx[2]:  # is_unique
+            cursor.execute(f"PRAGMA index_info({idx[1]})")
+            cols = [r[2] for r in cursor.fetchall()]
+            if cols == ["user_id"]:
+                return True
+    return False
+
+
 def init_db():
-    """Инициализация БД и миграция схемы при необходимости."""
+    """Инициализация БД с автоматической миграцией схемы."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS topics (
-            ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id       INTEGER NOT NULL,
-            topic_id      INTEGER NOT NULL,
-            closed        INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-
-    # Миграция: добавить колонку closed если её нет (старая схема)
+    # Проверяем, существует ли таблица и какие в ней колонки
     cursor.execute("PRAGMA table_info(topics)")
     columns = {row[1] for row in cursor.fetchall()}
 
-    if "ticket_number" not in columns:
-        # Совсем старая схема — пересоздаём
-        cursor.execute("DROP TABLE topics")
-        cursor.execute("""
-            CREATE TABLE topics (
-                ticket_number INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id       INTEGER NOT NULL,
-                topic_id      INTEGER NOT NULL,
-                closed        INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-    elif "closed" not in columns:
-        cursor.execute("ALTER TABLE topics ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
+    needs_rebuild = (
+        not columns                          # таблица не существует
+        or "ticket_number" not in columns    # совсем старая схема
+        or "closed" not in columns           # промежуточная схема без closed
+        or _has_unique_on_user_id(cursor)    # UNIQUE на user_id мешает повторным тикетам
+    )
+
+    if needs_rebuild and columns:
+        # Сохраняем данные, пересоздаём таблицу
+        shared = {"ticket_number", "user_id", "topic_id", "closed"} & columns
+        cursor.execute("ALTER TABLE topics RENAME TO topics_old")
+        cursor.execute(CORRECT_SCHEMA)
+        if shared:
+            cols = ", ".join(sorted(shared))
+            cursor.execute(f"INSERT INTO topics ({cols}) SELECT {cols} FROM topics_old")
+        cursor.execute("DROP TABLE topics_old")
+    elif not columns:
+        cursor.execute(CORRECT_SCHEMA)
 
     conn.commit()
     conn.close()
